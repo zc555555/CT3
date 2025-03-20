@@ -280,6 +280,21 @@ class RiscvNoParamsOperation(IRDLOperation):
             properties["comment"] = StringAttr(comment)
         super().__init__(properties=properties)
 
+@irdl_op_definition
+class SNEZOp(Riscv1Rd1RsOperation):
+    """
+    riscv_ssa.snez x => if x!=0 => x=1 else x=0
+    (It's a pseudo-instruction, you must expand it in final codegen or interpret accordingly)
+    """
+    name = "riscv_ssa.snez"
+
+@irdl_op_definition
+class SEQZOp(Riscv1Rd1RsOperation):
+    """
+    riscv_ssa.seqz x => if x==0 => x=1 else x=0
+    (Similarly a pseudo-instruction)
+    """
+    name = "riscv_ssa.seqz"
 
 @irdl_op_definition
 class LBOp(Riscv1Rd1Rs1ImmOperation):
