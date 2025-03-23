@@ -73,8 +73,26 @@ from riscv.ssa_dialect import (
     AllocOp
 )
 
-# 你可能用到的一些运算符，如 ANDIOp, ORIOp, SLTIOp 等:
-# from riscv.ssa_dialect import ANDIOp, ORIOp, SLTIOp, SLTIUOp  # 按需导入
+
+def _get_or_insert_block_result(block, rewriter: PatternRewriter, default_val: int = 1):
+    """
+    辅助函数: 获取 block 最后一条指令的 .value (若存在), 否则插入 li(default_val) 返回.
+    用于应对空 block 或最后指令不产生值时的情况, 避免 NoneType 错误.
+    """
+    last_op = block.ops.last
+    if not last_op:
+        # block 为空，插入 li(default_val)
+        fallback = LIOp(default_val)
+        # 注意: 我们无法插入到 block 本身(因为 inline 时机会已过),
+        # 暂时只返回 fallback, 由调用者将其插到正确的位置
+        return fallback, True
+    # 如果最后指令有 'value' 属性则用它
+    val = getattr(last_op, 'value', None)
+    if val is not None:
+        return val, False
+    # 否则插入 fallback
+    fallback = LIOp(default_val)
+    return fallback, True
 
 
 # =============== Pattern Implementations ===============
@@ -85,16 +103,15 @@ class LiteralPattern(RewritePattern):
     - int => li
     - bool => li(0/1)
     - None => li(0)
-    - string => (最简) li(0)，如果你要真在堆上分配字符串需额外处理
+    - string => (最简) li(0)  (可扩展成堆上分配)
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: Literal, rewriter: PatternRewriter):
         value = op.value
 
         # 整型
         if isinstance(value, IntegerAttr):
-            i_val = value.value.data  # 取出真实的 Python int
+            i_val = value.value.data  # Python int
             li_inst = LIOp(i_val)
             rewriter.replace_op(op, [li_inst])
             return
@@ -118,34 +135,28 @@ class LiteralPattern(RewritePattern):
             rewriter.replace_op(op, [li_inst])
             return
 
-        # 若出现其他情况, raise
         raise NotImplementedError(f"Unknown literal attr: {value}")
 
 
 class CallPattern(RewritePattern):
     """
-    choco.ir.call_expr =>
-    - 特殊情况: len(...) => 生成对 _error_len_none 的检查 & lw 读长度
-    - 其他 => 生成 riscv_ssa.call
+    choco.ir.call_expr => riscv_ssa.call
+    特殊: len(...) => beq => lw
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, op: CallExpr, rewriter: PatternRewriter):
         func_name = op.func_name.data
         args = list(op.args)
 
-        # 检查内置函数 len
+        # check len
         if func_name == "len":
-            # 1) zero = li(0)
             zero = LIOp(0)
-            # 2) beq(args[0], zero, => _error_len_none)
             check_none = BEQOp(args[0], zero, "_error_len_none")
-            # 3) read_size = lw(args[0], 0)
             read_size = LWOp(args[0], 0)
             rewriter.replace_op(op, [zero, check_none, read_size])
             return
 
-        # 其他函数 => 直接用 riscv_ssa.call
+        # normal call
         has_result = bool(op.results)
         call_inst = CallOp(func_name, args, has_result=has_result)
         rewriter.replace_op(op, [call_inst])
@@ -153,15 +164,10 @@ class CallPattern(RewritePattern):
 
 class AllocPattern(RewritePattern):
     """
-    choco.ir.alloc => 可能:
-      - 通过 heap (call _malloc)
-      - 或者放栈 (AllocOp)
-    示例: 先 li(4), 再 call _malloc
+    choco.ir.alloc => (示例) li(4), call _malloc
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, alloc_op: Alloc, rewriter: PatternRewriter):
-        # 简单：为对象分配4字节
         li_4 = LIOp(4)
         malloc_call = CallOp("_malloc", [li_4], has_result=True)
         rewriter.replace_op(alloc_op, [li_4, malloc_call])
@@ -169,10 +175,8 @@ class AllocPattern(RewritePattern):
 
 class StorePattern(RewritePattern):
     """
-    choco.ir.store => sw(value, memloc, 0)
-    注意: memloc 是指针(register中)
+    store => sw(value, memloc, 0)
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, store_op: Store, rewriter: PatternRewriter):
         sw_inst = SWOp(store_op.value, store_op.memloc, 0)
@@ -181,9 +185,8 @@ class StorePattern(RewritePattern):
 
 class LoadPattern(RewritePattern):
     """
-    choco.ir.load => lw(memloc, 0)
+    load => lw(memloc, 0)
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, load_op: Load, rewriter: PatternRewriter):
         lw_inst = LWOp(load_op.memloc, 0)
@@ -192,11 +195,8 @@ class LoadPattern(RewritePattern):
 
 class UnaryExprPattern(RewritePattern):
     """
-    choco.ir.unary_expr:
-      - op='-' => 0 - x
-      - op='not' => seqz(x) (x==0 =>1 else0)
+    unary_expr => -x or not x
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, unary_op: UnaryExpr, rewriter: PatternRewriter):
         op_str = unary_op.op.data
@@ -209,7 +209,7 @@ class UnaryExprPattern(RewritePattern):
             return
 
         if op_str == "not":
-            # seqz => if x==0 =>1 else0
+            # seqz => (x==0 =>1, else 0)
             seqz_ = SEQZOp(val)
             rewriter.replace_op(unary_op, [seqz_])
             return
@@ -219,11 +219,9 @@ class UnaryExprPattern(RewritePattern):
 
 class BinaryExprPattern(RewritePattern):
     """
-    choco.ir.binary_expr
-    常见: +, -, *, //, %, <, >, <=, >=, ==, !=
-    (and/or 是 EffectfulBinaryExpr)
+    binary_expr => +, -, *, //, %, <, >, <=, >=, ==, !=, is, is not, and, or
+    (无副作用场景 => 只计算布尔结果0/1)
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, bin_op: BinaryExpr, rewriter: PatternRewriter):
         op_str = bin_op.op.data
@@ -252,25 +250,24 @@ class BinaryExprPattern(RewritePattern):
             rewriter.replace_op(bin_op, [rem_])
             return
 
-        # 比较 => 结果0/1
+        # 比较 => 0/1
         if op_str == "<":
             slt_ = SLTOp(lhs, rhs)
             rewriter.replace_op(bin_op, [slt_])
             return
         if op_str == ">":
-            # x>y => y<x
+            # x>y => y<x => slt(rhs, lhs)
             slt_ = SLTOp(rhs, lhs)
             rewriter.replace_op(bin_op, [slt_])
             return
         if op_str == "<=":
             # x<=y => not(x>y)
-            # => x>y => y<x => slt(rhs,lhs), seqz
             slt_ = SLTOp(rhs, lhs)
             seqz_ = SEQZOp(slt_)
             rewriter.replace_op(bin_op, [slt_, seqz_])
             return
         if op_str == ">=":
-            # x>=y => not(x<y) => slt(lhs,rhs) => seqz
+            # x>=y => not(x<y)
             slt_ = SLTOp(lhs, rhs)
             seqz_ = SEQZOp(slt_)
             rewriter.replace_op(bin_op, [slt_, seqz_])
@@ -288,15 +285,40 @@ class BinaryExprPattern(RewritePattern):
             rewriter.replace_op(bin_op, [sub_, ne_])
             return
 
+        # Python 中的 "is" / "is not"
+        if op_str == "is":
+            sub_ = SubOp(lhs, rhs)
+            eq_ = SEQZOp(sub_)
+            rewriter.replace_op(bin_op, [sub_, eq_])
+            return
+        if op_str == "is not":
+            sub_ = SubOp(lhs, rhs)
+            ne_ = SNEZOp(sub_)
+            rewriter.replace_op(bin_op, [sub_, ne_])
+            return
+
+        # 处理无副作用的 and / or => 返回布尔值0/1
+        if op_str == "and":
+            snez_lhs = SNEZOp(lhs)
+            snez_rhs = SNEZOp(rhs)
+            and_ = ANDOp(snez_lhs, snez_rhs)
+            rewriter.replace_op(bin_op, [snez_lhs, snez_rhs, and_])
+            return
+        if op_str == "or":
+            snez_lhs = SNEZOp(lhs)
+            snez_rhs = SNEZOp(rhs)
+            or_ = OROp(snez_lhs, snez_rhs)
+            rewriter.replace_op(bin_op, [snez_lhs, snez_rhs, or_])
+            return
+
         raise NotImplementedError(f"Unsupported binary op: {op_str}")
 
 
 class IfPattern(RewritePattern):
     """
-    choco.ir.if(cond, then, else)
-    => 生成 label + 分支 + inline
+    if(cond, then, else):
+    => cond==0 -> else; otherwise then; end
     """
-
     counter: int = 0
 
     @op_type_rewrite_pattern
@@ -312,37 +334,31 @@ class IfPattern(RewritePattern):
         zero = LIOp(0)
         beq_ = BEQOp(cond, zero, label_else)
 
-        rewriter.insert_op_before_matched_op(zero, if_op)
-        rewriter.insert_op_before_matched_op(beq_, if_op)
+        rewriter.insert_op_before_matched_op(zero)
+        rewriter.insert_op_before_matched_op(beq_)
 
-        # label_then
         label_then_op = LabelOp(label_then)
-        rewriter.insert_op_before_matched_op(label_then_op, if_op)
-        # inline then block
-        rewriter.inline_block_before_matched_op(if_op.then.block, if_op)
+        rewriter.insert_op_before_matched_op(label_then_op)
+        rewriter.inline_block_before_matched_op(if_op.then.block)
 
-        # j -> after
         j_after = JOp(label_after)
-        rewriter.insert_op_before_matched_op(j_after, if_op)
+        rewriter.insert_op_before_matched_op(j_after)
 
-        # else label
         label_else_op = LabelOp(label_else)
-        rewriter.insert_op_before_matched_op(label_else_op, if_op)
-        rewriter.inline_block_before_matched_op(if_op.orelse.block, if_op)
+        rewriter.insert_op_before_matched_op(label_else_op)
+        rewriter.inline_block_before_matched_op(if_op.orelse.block)
 
-        # after
         label_after_op = LabelOp(label_after)
-        rewriter.insert_op_before_matched_op(label_after_op, if_op)
+        rewriter.insert_op_before_matched_op(label_after_op)
 
         rewriter.erase_matched_op(if_op)
 
 
 class AndPattern(RewritePattern):
     """
-    choco.ir.effectful_binary_expr(op='and'):
-    短路逻辑
+    effectful_binary_expr(op='and') => 短路
+    用于有副作用子表达式的短路场景
     """
-
     counter: int = 0
 
     @op_type_rewrite_pattern
@@ -351,64 +367,60 @@ class AndPattern(RewritePattern):
             return
         c = AndPattern.counter
         AndPattern.counter += 1
+
         label_rhs = f"and_rhs_{c}"
         label_after = f"and_after_{c}"
+        label_assign = f"and_assign_{c}"
 
-        # inline LHS
+        # inline LHS block 之前, 先判断 LHS block 最后是否产生值
         lhs_block = and_op.lhs.block
-        lhs_yield = lhs_block.ops.last  # type: ignore
-        lhs_val = lhs_yield.value
+        lhs_val, need_insert_lhs = _get_or_insert_block_result(lhs_block, rewriter, default_val=1)
+
+        # 现在插入 LHS block
+        rewriter.insert_op_before_matched_op(lhs_val) if need_insert_lhs else None
+        rewriter.inline_block_before_matched_op(lhs_block)
 
         zero = LIOp(0)
-        # beq(lhs_val,0) => jump after
         beq_skip = BEQOp(lhs_val, zero, label_after)
+        rewriter.insert_op_before_matched_op(zero)
+        rewriter.insert_op_before_matched_op(beq_skip)
 
-        # label rhs
         label_rhs_op = LabelOp(label_rhs)
+        rewriter.insert_op_before_matched_op(label_rhs_op)
 
-        # 插入
-        rewriter.insert_op_before_matched_op(zero, and_op)
-        rewriter.insert_op_before_matched_op(beq_skip, and_op)
-        rewriter.insert_op_before_matched_op(label_rhs_op, and_op)
-
-        # inline RHS
+        # inline RHS block
         rhs_block = and_op.rhs.block
-        rewriter.inline_block_before_matched_op(rhs_block, and_op)
-        rhs_yield = rhs_block.ops.last  # type: ignore
-        rhs_val = rhs_yield.value
+        rhs_val, need_insert_rhs = _get_or_insert_block_result(rhs_block, rewriter, default_val=1)
+        if need_insert_rhs:
+            rewriter.insert_op_before_matched_op(rhs_val)
+        rewriter.inline_block_before_matched_op(rhs_block)
 
-        # label_after
         label_after_op = LabelOp(label_after)
-        rewriter.insert_op_before_matched_op(label_after_op, and_op)
+        rewriter.insert_op_before_matched_op(label_after_op)
 
-        # 结果 => if lhs=0 => final=0 else final=rhs
-        # 做一个小汇编：temp=li(0); bne(lhs_val,0)-> set temp=rhs
+        # 最终结果：若 lhs=0 则整体为lhs，否则为rhs
         temp0 = LIOp(0)
-        c_label = f"and_assign_{c}"
-        label_assign = LabelOp(c_label)
-        bne_ = BNEOp(lhs_val, zero, c_label)
-        # move => temp = rhs
-        final_ = AddOp(rhs_val, zero)
+        bne_ = BNEOp(lhs_val, zero, label_assign)
+        rewriter.insert_op_before_matched_op(temp0)
+        rewriter.insert_op_before_matched_op(bne_)
 
-        # 顺序插入
-        rewriter.insert_op_before_matched_op(temp0, and_op)
-        rewriter.insert_op_before_matched_op(bne_, and_op)
-        rewriter.insert_op_before_matched_op(label_assign, and_op)
-        rewriter.insert_op_before_matched_op(final_, and_op)
+        label_assign_op = LabelOp(label_assign)
+        rewriter.insert_op_before_matched_op(label_assign_op)
 
-        # replace => 该EffectfulBinaryExpr的"result" 就是 final_
+        final_ = AddOp(rhs_val, temp0)  # => rhs_val + 0
+        # 全部替换
         rewriter.replace_matched_op(
             and_op,
             [
-                lhs_block.ops.last,
+                lhs_val if need_insert_lhs else (),
                 zero,
                 beq_skip,
                 label_rhs_op,
-                rhs_block.ops.last,
+                rhs_val if need_insert_rhs else (),
                 label_after_op,
                 temp0,
                 bne_,
-                label_assign,
+                label_assign_op,
                 final_,
             ],
             [final_],
@@ -417,9 +429,8 @@ class AndPattern(RewritePattern):
 
 class OrPattern(RewritePattern):
     """
-    choco.ir.effectful_binary_expr(op='or') 短路
+    effectful_binary_expr(op='or') => 短路
     """
-
     counter: int = 0
 
     @op_type_rewrite_pattern
@@ -428,62 +439,61 @@ class OrPattern(RewritePattern):
             return
         c = OrPattern.counter
         OrPattern.counter += 1
+
         label_rhs = f"or_rhs_{c}"
         label_after = f"or_after_{c}"
+        label_assign = f"or_assign_{c}"
 
-        # inline LHS
+        # inline LHS block
         lhs_block = or_op.lhs.block
-        lhs_yield = lhs_block.ops.last  # type: ignore
-        lhs_val = lhs_yield.value
+        lhs_val, need_insert_lhs = _get_or_insert_block_result(lhs_block, rewriter, default_val=0)
+        if need_insert_lhs:
+            rewriter.insert_op_before_matched_op(lhs_val)
+        rewriter.inline_block_before_matched_op(lhs_block)
 
         zero = LIOp(0)
-        # bne(lhs_val,0)-> skip => jump after
         bne_skip = BNEOp(lhs_val, zero, label_after)
+        rewriter.insert_op_before_matched_op(zero)
+        rewriter.insert_op_before_matched_op(bne_skip)
 
         label_rhs_op = LabelOp(label_rhs)
+        rewriter.insert_op_before_matched_op(label_rhs_op)
 
-        rewriter.insert_op_before_matched_op(zero, or_op)
-        rewriter.insert_op_before_matched_op(bne_skip, or_op)
-        rewriter.insert_op_before_matched_op(label_rhs_op, or_op)
-
-        # inline RHS
+        # inline RHS block
         rhs_block = or_op.rhs.block
-        rewriter.inline_block_before_matched_op(rhs_block, or_op)
-        rhs_yield = rhs_block.ops.last  # type: ignore
-        rhs_val = rhs_yield.value
+        rhs_val, need_insert_rhs = _get_or_insert_block_result(rhs_block, rewriter, default_val=1)
+        if need_insert_rhs:
+            rewriter.insert_op_before_matched_op(rhs_val)
+        rewriter.inline_block_before_matched_op(rhs_block)
 
         label_after_op = LabelOp(label_after)
-        rewriter.insert_op_before_matched_op(label_after_op, or_op)
+        rewriter.insert_op_before_matched_op(label_after_op)
 
-        # 结果 => if lhs!=0 => final=lhs_val else final=rhs_val
+        # unify final: 若 lhs!=0 则结果为lhs, 否则rhs
         temp0 = LIOp(0)
-        # 先 temp0=rhs_val
-        final_rhs = AddOp(rhs_val, zero)
+        final_rhs = AddOp(rhs_val, temp0)
+        bne_ = BNEOp(lhs_val, zero, label_assign)
+        rewriter.insert_op_before_matched_op(temp0)
+        rewriter.insert_op_before_matched_op(final_rhs)
+        rewriter.insert_op_before_matched_op(bne_)
 
-        c_label = f"or_assign_{c}"
-        label_assign = LabelOp(c_label)
-        bne_ = BNEOp(lhs_val, zero, c_label)
-        final_lhs = AddOp(lhs_val, zero)
+        label_assign_op = LabelOp(label_assign)
+        rewriter.insert_op_before_matched_op(label_assign_op)
 
-        rewriter.insert_op_before_matched_op(temp0, or_op)
-        rewriter.insert_op_before_matched_op(final_rhs, or_op)
-        rewriter.insert_op_before_matched_op(bne_, or_op)
-        rewriter.insert_op_before_matched_op(label_assign, or_op)
-        rewriter.insert_op_before_matched_op(final_lhs, or_op)
-
+        final_lhs = AddOp(lhs_val, temp0)
         rewriter.replace_matched_op(
             or_op,
             [
-                lhs_block.ops.last,
+                lhs_val if need_insert_lhs else (),
                 zero,
                 bne_skip,
                 label_rhs_op,
-                rhs_block.ops.last,
+                rhs_val if need_insert_rhs else (),
                 label_after_op,
                 temp0,
                 final_rhs,
                 bne_,
-                label_assign,
+                label_assign_op,
                 final_lhs,
             ],
             [final_lhs],
@@ -492,10 +502,9 @@ class OrPattern(RewritePattern):
 
 class IfExprPattern(RewritePattern):
     """
-    choco.ir.if_expr(cond, then, else)
-    在低层 SSA里需要phi合并, 这里仅简化处理(把两边inlined), 具体做法可用store+load或额外技巧
+    if_expr(cond, then, else):
+    => inline cond -> if=0 => else ; else => then
     """
-
     counter: int = 0
 
     @op_type_rewrite_pattern
@@ -511,39 +520,34 @@ class IfExprPattern(RewritePattern):
         zero = LIOp(0)
         beq_ = BEQOp(cond, zero, label_else)
 
-        rewriter.insert_op_before_matched_op(zero, if_op)
-        rewriter.insert_op_before_matched_op(beq_, if_op)
+        rewriter.insert_op_before_matched_op(zero)
+        rewriter.insert_op_before_matched_op(beq_)
 
-        # then
         label_then_op = LabelOp(label_then)
-        rewriter.insert_op_before_matched_op(label_then_op, if_op)
-        rewriter.inline_block_before_matched_op(if_op.then.block, if_op)
-        then_val = if_op.then_ssa_value
+        rewriter.insert_op_before_matched_op(label_then_op)
+        rewriter.inline_block_before_matched_op(if_op.then.block)
+        # then_val = if_op.then_ssa_value  # 不做实际phi; 仅执行
 
         j_after = JOp(label_after)
-        rewriter.insert_op_before_matched_op(j_after, if_op)
+        rewriter.insert_op_before_matched_op(j_after)
 
-        # else
         label_else_op = LabelOp(label_else)
-        rewriter.insert_op_before_matched_op(label_else_op, if_op)
-        rewriter.inline_block_before_matched_op(if_op.or_else.block, if_op)
-        else_val = if_op.or_else_ssa_value
+        rewriter.insert_op_before_matched_op(label_else_op)
+        rewriter.inline_block_before_matched_op(if_op.or_else.block)
+        # else_val = if_op.or_else_ssa_value
 
-        # label_after
         label_after_op = LabelOp(label_after)
-        rewriter.insert_op_before_matched_op(label_after_op, if_op)
+        rewriter.insert_op_before_matched_op(label_after_op)
 
-        # 简易: 不做真正phi, 只erase(无法返回单一值给后续)
-        # 若测试需要 if_expr 的值, 需额外逻辑(如在then/else都store同一栈slot再load)
+        # 不做真正的 phi
         rewriter.erase_matched_op(if_op)
 
 
 class WhilePattern(RewritePattern):
     """
-    choco.ir.while(cond, body)
-    => label_loop, inline cond => if cond==0 => jump after => inline body => j loop => label_after
+    while(cond, body):
+    => label_loop => inline cond => beq(cond,0)->after => inline body => j(loop) => label_after
     """
-
     counter: int = 0
 
     @op_type_rewrite_pattern
@@ -553,40 +557,35 @@ class WhilePattern(RewritePattern):
         label_loop = f"while_loop_{c}"
         label_after = f"while_after_{c}"
 
-        # label_loop
         label_loop_op = LabelOp(label_loop)
-        rewriter.insert_op_before_matched_op(label_loop_op, while_op)
+        rewriter.insert_op_before_matched_op(label_loop_op)
 
-        # inline cond
-        rewriter.inline_block_before_matched_op(while_op.cond.block, while_op)
-        cond_yield = while_op.cond.block.ops.last  # type: ignore
-        cond_val = cond_yield.value
+        rewriter.inline_block_before_matched_op(while_op.cond.block)
+        cond_yield = while_op.cond.block.ops.last
+        cond_val = cond_yield.value if cond_yield and hasattr(cond_yield, 'value') else LIOp(1)
+        if cond_yield is None:
+            # 如果cond block完全空, 这里插入 fallback
+            rewriter.insert_op_before_matched_op(cond_val)
 
         zero = LIOp(0)
         beq_ = BEQOp(cond_val, zero, label_after)
-        rewriter.insert_op_before_matched_op(zero, while_op)
-        rewriter.insert_op_before_matched_op(beq_, while_op)
+        rewriter.insert_op_before_matched_op(zero)
+        rewriter.insert_op_before_matched_op(beq_)
 
-        # inline body
-        rewriter.inline_block_before_matched_op(while_op.body.block, while_op)
-
-        # jump back
+        rewriter.inline_block_before_matched_op(while_op.body.block)
         j_loop = JOp(label_loop)
-        rewriter.insert_op_before_matched_op(j_loop, while_op)
+        rewriter.insert_op_before_matched_op(j_loop)
 
-        # label_after
         label_after_op = LabelOp(label_after)
-        rewriter.insert_op_before_matched_op(label_after_op, while_op)
+        rewriter.insert_op_before_matched_op(label_after_op)
 
         rewriter.erase_matched_op(while_op)
 
 
 class ForPattern(RewritePattern):
     """
-    choco.ir.for(...)
-    在 CT3 中可能已在前端 pass 转为 while; 如果还存在 for, 这里可做not implemented
+    If the IR still has "for", either lower it or raise NotImplemented
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, for_op: For, rewriter: PatternRewriter):
         raise NotImplementedError("For loops are expected to be lowered to While first.")
@@ -594,44 +593,39 @@ class ForPattern(RewritePattern):
 
 class ListExprPattern(RewritePattern):
     """
-    choco.ir.list_expr(...) => 在堆上分配, 存length + 元素
+    list_expr => heap allocate [length + elements], 返回指针
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, list_expr: ListExpr, rewriter: PatternRewriter):
         elems = list(list_expr.elems)
         length = len(elems)
 
-        # 分配 total_bytes= 4(length) + 4 * len(elems)
         total_bytes = 4 + 4 * length
         li_size = LIOp(total_bytes)
         malloc_ = CallOp("_malloc", [li_size], has_result=True)
 
-        # store length => sw(len, malloc_, 0)
         store_len = SWOp(LIOp(length), malloc_, 0)
 
         ops_ = [li_size, malloc_, store_len]
-
         offset = 4
         for e in elems:
             sw_ = SWOp(e, malloc_, offset)
             ops_.append(sw_)
             offset += 4
 
-        rewriter.replace_op(list_expr, ops_)
+        # 最后必须产生 1 个结果(指向list的指针)
+        rewriter.replace_op(list_expr, ops_, [malloc_])
 
 
 class GetAddressPattern(RewritePattern):
     """
-    choco.ir.get_address(value, index) => &value[index]
-    => offset=4 + index*4 => add base, offset
+    get_address(value, index) => base + 4 + index*4
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, get_address: GetAddress, rewriter: PatternRewriter):
         val = get_address.value
         idx = get_address.index
-        # offset = 4 + idx*4
+
         one = LIOp(1)
         plus_one = AddOp(idx, one)
         four = LIOp(4)
@@ -640,18 +634,19 @@ class GetAddressPattern(RewritePattern):
 
         rewriter.replace_op(
             get_address,
-            [one, plus_one, four, times4, final_addr]
+            [one, plus_one, four, times4, final_addr],
+            [final_addr],
         )
 
 
 class IndexStringPattern(RewritePattern):
     """
-    choco.ir.index_string(value, index) => bound check + offset
-    => if val=0 => _list_index_none
-       load length => if idx>=length => _list_index_oob
-       final ptr= base+(4+idx*4)
+    index_string =>
+      1) check none
+      2) check idx < 0 => _list_index_oob
+      3) check idx >= length => _list_index_oob
+      4) compute address: base + (idx+1)*4
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, indexString: IndexString, rewriter: PatternRewriter):
         val = indexString.value
@@ -660,12 +655,14 @@ class IndexStringPattern(RewritePattern):
         zero = LIOp(0)
         check_none = BEQOp(val, zero, "_list_index_none")
 
+        # load length
         length = LWOp(val, 0)
-        # if idx>=length => jump => _list_index_oob
-        # BGEOp(idx, length, label)
+
+        # 检查 idx < 0
+        blt_neg = BLTOp(idx, zero, "_list_index_oob")
+        # 检查 idx >= length
         check_oob = BGEOp(idx, length, "_list_index_oob")
 
-        # compute address
         one = LIOp(1)
         plus_one = AddOp(idx, one)
         four = LIOp(4)
@@ -674,34 +671,28 @@ class IndexStringPattern(RewritePattern):
 
         rewriter.replace_op(
             indexString,
-            [zero, check_none, length, check_oob, one, plus_one, four, times4, final_ptr]
+            [
+                zero, check_none, length, blt_neg, check_oob,
+                one, plus_one, four, times4, final_ptr
+            ],
+            [final_ptr],
         )
 
 
 class AssignPattern(RewritePattern):
     """
-    choco.ir.assign(target, value)
-    一般在 ChocoPy 中转成 store(load_of_target, value)? 也许已被处理
-    如果还存在, 这里可尝试:
-       - 如果 target 是内存地址 => store
-       - 如果 target/ value 都是 register => 变成 addOp(value, zero)?
+    assign(target, value).
+    If target is Memloc => store
+    If target is register => move
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, assign_op: Assign, rewriter: PatternRewriter):
-        # 可能 “assign x, y” => x 是个 memloc?
-        # or x 直接是个 register
         target = assign_op.target
         val = assign_op.value
-        # 由于 IR 里通常 x=... 会拆成 storeOp,
-        # 也可能 assign保留对对象字段赋值?
-        # 这里做个简易: store(val, target, 0) if target是MemlocType
-        # 否则 move
         if isinstance(target.type, MemlocType):
             sw_ = SWOp(val, target, 0)
             rewriter.replace_op(assign_op, [sw_])
         elif isinstance(target.type, RegisterType):
-            # move => addOp(val, 0)
             zero = LIOp(0)
             mv_ = AddOp(val, zero)
             rewriter.replace_op(assign_op, [zero, mv_])
@@ -711,10 +702,8 @@ class AssignPattern(RewritePattern):
 
 class MemberExprPattern(RewritePattern):
     """
-    choco.ir.member_expr(value, attribute)
-    访问对象字段 => 可能不在CT3用. 这里先不实现或 raise
+    For object fields, not implemented in this pass
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, memexpr: MemberExpr, rewriter: PatternRewriter):
         raise NotImplementedError("MemberExpr not implemented in this pass.")
@@ -722,9 +711,8 @@ class MemberExprPattern(RewritePattern):
 
 class ClassDefPattern(RewritePattern):
     """
-    choco.ir.class_def => for OOP, not used or partial
+    Not used or partial in this pass
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, clsdef: ClassDef, rewriter: PatternRewriter):
         raise NotImplementedError("ClassDef not implemented in this pass.")
@@ -732,9 +720,8 @@ class ClassDefPattern(RewritePattern):
 
 class PassPattern(RewritePattern):
     """
-    choco.ir.pass => no-op
+    pass => no-op
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, pass_op: Pass, rewriter: PatternRewriter):
         rewriter.erase_matched_op(pass_op)
@@ -742,9 +729,8 @@ class PassPattern(RewritePattern):
 
 class YieldPattern(RewritePattern):
     """
-    删除 choco.ir.yield（我们已将其值在父Op中用到）
+    Remove yield
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, y_op: Yield, rewriter: PatternRewriter):
         rewriter.erase_matched_op(y_op)
@@ -752,9 +738,8 @@ class YieldPattern(RewritePattern):
 
 class FuncDefPattern(RewritePattern):
     """
-    choco.ir.func_def => riscv_ssa.func
+    func_def => riscv_ssa.func
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, func: FuncDef, rewriter: PatternRewriter):
         new_func = FuncOp.create(
@@ -770,9 +755,8 @@ class FuncDefPattern(RewritePattern):
 
 class ReturnPattern(RewritePattern):
     """
-    choco.ir.return => riscv_ssa.return
+    return => riscv_ssa.return
     """
-
     @op_type_rewrite_pattern
     def match_and_rewrite(self, ret: Return, rewriter: PatternRewriter):
         val = ret.value
@@ -783,14 +767,16 @@ class ReturnPattern(RewritePattern):
 # =========== 主 Pass ===========
 
 class ChocoFlatToRISCVSSA(ModulePass):
+    """
+    Convert the choco_ir (flat) dialect to riscv_ssa dialect
+    """
     name = "choco-flat-to-riscv-ssa"
 
     def apply(self, ctx: MLContext, op: ModuleOp) -> None:
-        # 第一次：匹配大部分IR ops
+        # 1) Main pass
         walker = PatternRewriteWalker(
             GreedyRewritePatternApplier(
                 [
-                    # 语句/表达式
                     LiteralPattern(),
                     CallPattern(),
                     AllocPattern(),
@@ -819,7 +805,7 @@ class ChocoFlatToRISCVSSA(ModulePass):
         )
         walker.rewrite_module(op)
 
-        # 第二次：专门把 Yield 去掉
+        # 2) Remove any yields
         walker2 = PatternRewriteWalker(
             GreedyRewritePatternApplier([YieldPattern()]),
             apply_recursively=True,
